@@ -2,11 +2,9 @@
  * This scrips triggers a laser using PWM to control the average power output
  * and to adjust the Pulse Repitition Rate (PRR). The PRR and duty cycle are 
  * set by two external dials, read into the system using inbuild ADC's. An LCD
- * screen is used to display the PRR and DC values to the user.
+ * screen is used to display the PRR, DC and pulse high time values to the user.
  * 
- * No parameters needs to be memorised for this project. 
- * The IO connections from the teensy3.1 for this project (the 100W hand held 
- * laser) is as follows:
+ * The IO connections from the teensy3.1 for this project is as follows:
  * LCD--
  * RS: 8 (test = 22)
  * EN: 9 (test = 20)
@@ -15,26 +13,25 @@
  * D6: 6 (test = 17)
  * D7: 7 (test = 16)
  * Laser--
- * Trigger: 12
- * Power Level: 23 (A9)
+ * Trigger: 3
+ * Power Level: 23 (A9) -INPUT
  * Dials--
- * PRR: 14 (A0)
- * Duty Cycle: 15 (A1)
+ * PRR: 14 (A0) -INPUT
+ * Duty Cycle: 15 (A1) -INPUT
  * 
  * The dials and power level must sweep between 0 and 3.3 volts.
  * 
- * The relationship between PRR, Power and DC is not simple. The image 
- * '100w operating mode.png' shows this relationship graphically.
+ * PRR ranges from 20kHz - 600kHz. The dial should be logarithmic-scaled?
+ * Duty cycle ranges from 0.2 - 36%. The dial should be linear.
  */
 
 // ----------- includes --------------------------
 #include <LiquidCrystal.h> //includes the IO library for the LCD display
 #include <Metro.h> //library used for timing for restarting of the laser timer
+#include <math.h> //library for calculating logarithmic dial parameters
 
 // ------- Pin macros ----------------
-#define LaserPin 12 //Laser control is via Teensy 3.1 pin 12
-#define LaserOn digitalWriteFast(LaserPin,HIGH) //The laser is active HIGH
-#define LaserOff digitalWriteFast(LaserPin,LOW) //The laser is disabled LOW
+#define LaserPin 3 //Laser control is via Teensy 3.1 pin 3
 #define PRRdialPin 14 //PRR is set using an analog signal on pin 14
 #define DCdialPin 15 //DC is set using an analog signal on pin 15
 #define PwrLvlPin 23 //Power level is read from A9 on pin 23
@@ -46,15 +43,11 @@
 #define _lcdD7 7 //LCD data 7 pin
 
 //--------- variable definitions ----------
-IntervalTimer timerLaser; //timer object used for Laser pulsing
-LiquidCrystal lcd( _lcdRS, _lcdEN, _lcdD4, _lcdD5, _lcdD6, _lcdD7 ); //LCD pin initilise //lcd(22,21,20,19,18,17,16);//
-Metro refreshMetro = Metro(250); //the laser timer is restarted 4 times a second
-float PRR = 1.0; //ie, 1 kHz.
-float Duty = 50.0; //ie, 50%.
+LiquidCrystal lcd( _lcdRS, _lcdEN, _lcdD4, _lcdD5, _lcdD6, _lcdD7 ); //lcd(27,28,29,30,31,32,33);
+Metro refreshMetro = Metro(250); //the dials are checked 4 times a second
+float PRR =300.0; //ie, 300 kHz.
+float Duty = 5.0; //ie, 5%.
 float PwrLvl = 0; //no power
-float _onTime = 0; //the time the laser is on for
-float _offTime = 0; //the time the laser is off for
-uint8_t Mode = 1; //This is to identify if the laser is in CW - pulsed - off mode (2-1-0)
 
 //-------- Setup functions --------------
 void setup() {
@@ -69,7 +62,7 @@ void setup() {
   
   // setup the serial port
   Serial.begin(9600); //serial port used for sending debug messages only
-  Serial.println("Initalising...");
+  Serial.println("Initalising..."); //send a generic startup message to the serial port
 
   // setup pin directions
   pinMode(LaserPin,OUTPUT); //LaserPin pin as ouput
@@ -77,12 +70,13 @@ void setup() {
   pinMode(DCdialPin,INPUT); // PRRdialPin as input
   pinMode(PwrLvlPin,INPUT); // PwrLvl as input
 
-  // set up the pin states
-  LaserOff;
-
   // set up the ADC system
   analogReadResolution(12); //12-bit input resolution for dials
   analogReference(DEFAULT); //uses the 3.3v as a reference.
+
+  // set up the hardware pulse generator
+  analogWriteResolution(12); //12-bit settings for duty cycle
+  analogWriteFrequency(LaserPin,PRR*1000); //set the frequency to PRR * 1000 (ie, PRR in Hz).
 
   // small delay for effect - serves no other purpose
   delay(1000); //about 1 seconds
@@ -90,7 +84,7 @@ void setup() {
   //Get the values and start the pulses
   PRR = GetPRRvalue(); //read the PRR value from the dials
   Duty = GetDutyValue(); //read the Duty value from the dials
-  RestartTimer(); //start the main laser timer
+  ConfigurePulseGenerator(); //configures the pulse generator
 }
 
 void loop() {
@@ -98,7 +92,7 @@ void loop() {
     PRR = GetPRRvalue(); //read the PRR value from the dials
     Duty = GetDutyValue(); //read the Duty value from the dials
     PwrLvl = GetPwrLevel(); //reads the laser power level from the system
-    RestartTimer(); //restarts the timer based on the new values
+    ConfigurePulseGenerator(); //configures the pulse generator
     SendSerialUpdate(); //sends some messages to the serial port for debugging
     UpdateLCD(); //updates the LCD display
   }
@@ -106,17 +100,22 @@ void loop() {
 
 float GetPRRvalue(void){
   uint16_t DialValue = analogRead(PRRdialPin); //returns a 12-bit value for PRR
-  /* 0 = 1kHz
-   * 4095 = 30kHz
-   * Described as linear relationship Y = MX + C where
+  /* 0 = 20kHz
+   * 4095 = 600kHz
+   * Described as an exponential relationship Y = A^(BX) + C where
    *    Y = PRR (in kHz)
-   *    M = 0.007082
-   *    X = DialValue
-   *    C = 1
+   *    A = 584
+   *    B = 0.000244
+   *    C = 19
+   *    X = DialValue in DAX
     */
-    if (DialValue >4095)
-      DialValue = 4095;
-  return ((0.007082 * (float)DialValue) + 1);
+  const float A = 584;
+  const float B = 0.000244;
+  const float C = 19;
+    
+    if (DialValue >4095) //check if the value is greter than 600kHz (should not be possible)
+      DialValue = 4095; //limit it to 600khz if it is greater
+  return ((float)pow(A , (B * (float)DialValue)) + C); //return the khz value for PRR
 }
 
 float GetPwrLevel(void){
@@ -135,165 +134,93 @@ float GetPwrLevel(void){
 }
 
 float GetDutyValue(void){
+  /*
+   * Duty cycle depends entirely on the PRR!
+   * min pulse time = 100ns
+   * max pulse time = 600ns
+   */
+  const float minT = 100.0; //minimum ON time in nanoseconds
+  const float maxT = 600.0; //maximum ON time in nanoseconds
+  float PeriodPRR = 1000000/PRR; //the period in nanoseconds
+  float minDuty = (100 * minT) / PeriodPRR; //the minimum duty cycle in %
+  float maxDuty = (100 * maxT) / PeriodPRR; //the maximum duty cycle in % 
   uint16_t DialValue = analogRead(DCdialPin); //returns a 12-bit value for Duty
-  /* 0 = 0 %
-   * 4095 = 100 %
+  /* 0 = 0.2 %
+   * 4095 = 36.0 %
    * Described as linear relationship Y = MX + C where
    *    Y = DC (in %)
-   *    M = 0.02442
-   *    X = DialValue
-   *    C = 0
+   *    M = 0.008742 ... this value is now variable
+   *    X = DialValue 
+   *    C = 0.2 ... this value is now variable
     */
-  return (0.02442 * (float)DialValue);
+  float M = (maxDuty - minDuty) / 4095; // M = rise / run = (max - min) / DAC bit range.
+  float C = minDuty;
+  return ((M * (float)DialValue) + C);
 }
 
-void RestartTimer(void){
-  //always restart the laser on the off cycle!
-  CalculateModeValues(); //calcualtes the new timing values
-  timerLaser.end(); //ends the laser (if it wasnt already)
-  if (Mode == 2){
-    LaserOn; //mode 2 is CW - turn the laser on!
+void ConfigurePulseGenerator(void){
+  if(isUpdateNeeded()){ //set the PRR if the update is needed
+    analogWriteFrequency(LaserPin,PRR*1000); //set the frequency to PRR * 1000 (ie, PRR in Hz).
   }
-  else if (Mode == 1){
-    LaserOff;
-    timerLaser.begin(LaserToggle,_offTime);
-  }
-  else {
-    LaserOff; //mode 0 is laser off - turn the laser off!
-  }
-}
-
-void LaserToggle(){
-  if (digitalReadFast(LaserPin) == HIGH){
-    LaserOff;
-    timerLaser.begin(LaserToggle,_offTime);
-  }
-  else {
-    LaserOn;
-    timerLaser.begin(LaserToggle,_onTime);
-  }
+  //set the Duty every time (no jitter issues here)
+  analogWrite(LaserPin,(uint16_t)((Duty * 40.95)+0.5)); //Duty cycle outputs to 4095 digital (ie, 100% = 4095)
+  //therefore, Duty/40.95 = duty cycle in digital units. Adding 0.5 at the end helps with rounding.
 }
 
 void SendSerialUpdate(void){
-  Serial.print("Mode: ");
-  Serial.print(Mode);
-  Serial.print(", PRR: ");
+  Serial.print("PRR: ");
   Serial.print(PRR);
   Serial.print(" ,Duty: ");
   Serial.print(Duty);
+  Serial.print(" ,Pulse Time (ns): ");
+  Serial.print(((1000000/PRR) * (Duty / 100)));
   Serial.print(" ,PwrLvl: ");
   Serial.println(PwrLvl);
 }
 
 void UpdateLCD(void){
-  if (Mode == 2){
-    lcd.clear();
-    lcd.setCursor(1,0);
-    lcd.print("Laser CW Mode");
+  lcd.clear(); //clear the display
+  //The location of the number changes depending on its value!
+  if (PRR >= 10){
+    lcd.setCursor(3,0); //set the cursor position to row 0, column 3
   }
-  else if (Mode == 1){
-    lcd.clear(); //clear the display
-    //The location of the number changes depending on its value!
-    if (PRR >= 10){
-      lcd.setCursor(3,0); //set the cursor position to row 0, column 3
-    }
-    else{
-      lcd.setCursor(4,0); //set the cursor position to row 0, column 4
-    }
-    lcd.print(PRR); //4 or 5 characters
-    lcd.print(" kHz");
-    //The location of the Duty number changes depending on its value!
-    if (Duty >= 10){
-      lcd.setCursor(2,1); //set the cursor position to row 1, column 2
-    }
-    else{
-      lcd.setCursor(3,1); //set the cursor position to row 1, column 3
-    }
-    lcd.print(Duty); //4 or 5 characters
-    lcd.print(" % Duty");
-    }
-    else {
-      lcd.clear();
-      lcd.setCursor(3,0);
-      lcd.print("Laser Off");
-    }
+  else{
+    lcd.setCursor(4,0); //set the cursor position to row 0, column 4
+  }
+  lcd.print((PRR+0.049),1); //4 or 5 characters
+  lcd.print(" kHz");
+  //The location of the pulse time is fixed (always in the hundreds range)
+  float pulseTime = ((1000000/PRR) * (Duty / 100));
+  lcd.setCursor(0,1); //set the cursor position to row 1, column 0
+  lcd.print((pulseTime+0.049),1); //always 5 characters
+  lcd.print(" Pulse (ns)");
 }
 
-void CalculateModeValues(void){
-/*
- * These calculations are based off the diagram send in emails called
- * '100w operating mode.png'.
- * 
- * At 30kHz, the max DC is 75% and min DC is 25%
- * At 10kHz and less, the max DC is 95% and the min DC is 5%
- * 
- * All values higher than MAX DC end up as mode 2 (Laser ON in CW mode)
- * All values less than MIN DC end up as mode 0 (Laser OFF)
- * 
- * Additionally: - NOT IN DIAGRAM!
- * At PwrLvl 110%, the max DC is 45%
- * At PwrLvl 50%, the max DC is 100%
- * 
- * Any value in between is calcualted _onTime and _offTime
- */
-
- //First step would be to calculate Dmin and Dmax for the current frequency
- float Dmin = 5; //default for anything less than 10kHz
- float Dmax = 95; //default for anyything less than 10kHz
- if (PRR > 10){ // anything more than 10kHz needs to be adjusted
-  /* 10 kHz = 95 Dmax
-   * 30 kHz = 75 Dmax
-   * Described as linear relationship Y = MX + C where
-   *    Y = Dmax (in %)
-   *    M = -1
-   *    X = PRR
-   *    C = 105
+bool isUpdateNeeded(void){
+  /*
+   * Using an integrator to measure the error between current PRR and set PRR.
+   * The integrator should be good for filtering noise on the set PRR value
+   * and redude the need to continually set the frequency (which would cause jitters in the pulses)
+   * 
+   * The process goes like this:
+   * 1: currentError = setPRR - currentPRR
+   * 2: integratedError += currentError
+   * 3: if integrated Error >< some error window (10%?) then change the current PRR and reset integratedError: return TRUE
+   *         else return false
    */
-    Dmax = ((-1 * PRR) + 105);
-  /* 10 kHz = 5 Dmin
-   * 30 kHz = 25 Dmin
-   * Described as linear relationship Y = MX + C where
-   *    Y = Dmin (in %)
-   *    M = 1
-   *    X = PRR
-   *    C = -5
-   */
-    Dmin = ((1 * PRR) - 5);
- }
- //Check if higher than Dmax
- if (Duty > Dmax){
-  //It is higher, so make it mode 2 : laser CW
-  Mode = 2;
-  timerLaser.end();
-  _onTime = 0;
-  _offTime = 0;
- }
- //check if its is lower than Dmin
- else if (Duty < Dmin){
-  //It is lower, so make it mode 0 : laser off
-  Mode = 0;
-  timerLaser.end();
-  _onTime = 0;
-  _offTime = 0;
- }
- //If its not bigger or small that the DC limits, calculate the ON/OFF times
- else{
-  Mode = 1;
-  _onTime = ((1000 / PRR) * (Duty / 100));
-  _offTime =  ((1000 / PRR) * (1 - (Duty / 100)));
- }
+   const float errorThreshold = 1.5; //the error threshold is 1.5 kHz (integrated errors larger than this will trigger an update)
+   static float integratedError = 0; //initalise the integrated error to Zero
+   static float currentPRR = 0; //initalising it to zero means the first read will always produce a big error (a good thing!)
 
- //Additional checks here. Only if the laser is on and the power is set above 50%
- if ((Mode != 0) && (PwrLvl > 50)){
-  //Calculate the DC limit for this Power level
-  float Dlim = (-1 * 0.9166 * PwrLvl) + 145.83;
-  if (Duty > Dlim){
-    //The duty cycle must be limited!
-    Mode = 1;
-    Duty = Dlim;
-    _onTime = ((1000 / PRR) * (Duty / 100));
-    _offTime =  ((1000 / PRR) * (1 - (Duty / 100)));
-  }
- }
+   float currentError = PRR - currentPRR; //this is the error in kHz
+   integratedError = integratedError + currentError; //this is the accumulative error over time (once ever 250ms)
+
+   if ((integratedError > errorThreshold) | (integratedError < (-1 * errorThreshold))){
+     //error is outside threshold. initate an update!
+     integratedError = 0; //reset the error integrator
+     currentPRR = PRR; //assign the setPRR to the currentPRR
+     return true; //return TRUE to initiate the update
+   }
+   else
+     return false;
 }
-
