@@ -15,9 +15,13 @@
  * Laser--
  * Trigger: 3
  * Power Level: 23 (A9) -INPUT
- * Dials--
+  * Dials--
  * PRR: 14 (A0) -INPUT
  * Duty Cycle: 15 (A1) -INPUT
+ * System--
+ * Trigger Selection Pin: 1 (HIGH = ext; LOW = int)
+ * Temperature safety cutoff input: 20 (active high)
+ * E-stop: 19 (active high)
  * 
  * The dials and power level must sweep between 0 and 3.3 volts.
  * 
@@ -41,13 +45,16 @@
 #define _lcdD5 5 //LCD data 5 pin
 #define _lcdD6 6 //LCD data 6 pin
 #define _lcdD7 7 //LCD data 7 pin
+#define TriggerSourcePin 1 //Trigger source selector switch: internal=LOW external=HIGH
+#define TemperatureSensorPin 20 //Temperature protection enabled when HIGH
+#define EstopPin 19 //Estop when HIGH
 
 //--------- variable definitions ----------
 LiquidCrystal lcd( _lcdRS, _lcdEN, _lcdD4, _lcdD5, _lcdD6, _lcdD7 ); //lcd(27,28,29,30,31,32,33);
-Metro refreshMetro = Metro(250); //the dials are checked 4 times a second
-float PRR =300.0; //ie, 300 kHz.
-float Duty = 5.0; //ie, 5%.
-float PwrLvl = 0; //no power
+Metro refreshMetro = Metro(250); //the dials and pins are checked 4 times a second
+float PRR =300.0; //default value: ie, 300 kHz.
+float Duty = 5.0; //default value: ie, 5%.
+float PwrLvl = 0; //default value: no power
 
 //-------- Setup functions --------------
 void setup() {
@@ -69,6 +76,9 @@ void setup() {
   pinMode(PRRdialPin,INPUT); // PRRdialPin as input
   pinMode(DCdialPin,INPUT); // PRRdialPin as input
   pinMode(PwrLvlPin,INPUT); // PwrLvl as input
+  pinMode(TriggerSourcePin,INPUT); //Trig source selector as input
+  pinMode(TemperatureSensorPin,INPUT); //Temperature sensor as input
+  pinMode(EstopPin,INPUT); //Estop sensor as input
 
   // set up the ADC system
   analogReadResolution(12); //12-bit input resolution for dials
@@ -168,32 +178,64 @@ void ConfigurePulseGenerator(void){
 }
 
 void SendSerialUpdate(void){
-  Serial.print("PRR: ");
+  Serial.print("Trigger: ");
+  if (!digitalReadFast(TriggerSourcePin))
+    Serial.print("Int");
+  else
+    Serial.print("Ext");
+  Serial.print(" ,PRR: ");
   Serial.print(PRR);
   Serial.print(" ,Duty: ");
   Serial.print(Duty);
   Serial.print(" ,Pulse Time (ns): ");
   Serial.print(((1000000/PRR) * (Duty / 100)));
   Serial.print(" ,PwrLvl: ");
-  Serial.println(PwrLvl);
+  Serial.print(PwrLvl);
+  Serial.print(" ,Temperature Alarm: ");
+  Serial.print(digitalReadFast(TemperatureSensorPin));
+  Serial.print(" ,Estop Active: ");
+  Serial.println(digitalReadFast(EstopPin));
 }
 
 void UpdateLCD(void){
   lcd.clear(); //clear the display
-  //The location of the number changes depending on its value!
-  if (PRR >= 10){
-    lcd.setCursor(3,0); //set the cursor position to row 0, column 3
+  if (digitalReadFast(EstopPin)){ //check the emergency stop
+    //emergency stop button is active. Tell the user!
+    lcd.setCursor(2,0); //set the cursor position to row 0, column 2
+    lcd.print("ESTOP ACTIVE");
+    lcd.setCursor(4,1); //set the cursor position to row 1, column 4
+    lcd.print("no laser");
+    return; //exit the LCD routine
+  }
+  if (digitalReadFast(TemperatureSensorPin)){ //the laser is too hot
+    //laser is too hot. Tell the user!
+    lcd.setCursor(1,0); //set the cursor position to row 0, column 1
+    lcd.print("!TEMPERATURE!!");
+    lcd.setCursor(4,1); //set the cursor position to row 1, column 4
+    lcd.print("no laser");
+    return; //exit the LCD routine
+  }
+  //only print the dial values to the display when the trigger is set for internal:
+  if (!digitalReadFast(TriggerSourcePin)){
+    //The location of the number changes depending on its value!
+    if (PRR >= 10){
+      lcd.setCursor(3,0); //set the cursor position to row 0, column 3
+    }
+    else{
+      lcd.setCursor(4,0); //set the cursor position to row 0, column 4
+    }
+    lcd.print((PRR+0.049),1); //4 or 5 characters
+    lcd.print(" kHz");
+    //The location of the pulse time is fixed (always in the hundreds range)
+    float pulseTime = ((1000000/PRR) * (Duty / 100));
+    lcd.setCursor(0,1); //set the cursor position to row 1, column 0
+    lcd.print((pulseTime+0.049),1); //always 5 characters
+    lcd.print(" Pulse (ns)");
   }
   else{
     lcd.setCursor(4,0); //set the cursor position to row 0, column 4
+    lcd.print("EXTERNAL"); //print 'external' to the lcd
   }
-  lcd.print((PRR+0.049),1); //4 or 5 characters
-  lcd.print(" kHz");
-  //The location of the pulse time is fixed (always in the hundreds range)
-  float pulseTime = ((1000000/PRR) * (Duty / 100));
-  lcd.setCursor(0,1); //set the cursor position to row 1, column 0
-  lcd.print((pulseTime+0.049),1); //always 5 characters
-  lcd.print(" Pulse (ns)");
 }
 
 bool isUpdateNeeded(void){
